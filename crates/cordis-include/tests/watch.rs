@@ -93,3 +93,42 @@ fn suspended_files_stay_silent() {
     );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+#[test]
+fn a_busy_sibling_file_does_not_starve_reloads() {
+    let path = isolated_dir("busy-sibling");
+    std::fs::write(&path, "entries: []\n").unwrap();
+    let file = LoaderFile::open(&path).unwrap();
+    let fired = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&fired);
+    let _watcher = file
+        .watch(move || flag.store(true, Ordering::SeqCst))
+        .unwrap();
+
+    // A neighbour touched far more often than the debounce window, like a
+    // log file next to the config. Before the fix, its events kept
+    // postponing the debounce, so the config change was never reported.
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = {
+        let stop = Arc::clone(&stop);
+        let sibling = path.with_file_name("app.log");
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::fs::write(&sibling, "tick");
+                let _ = std::fs::read(&sibling);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !fired.load(Ordering::SeqCst),
+        "sibling activity is not a change"
+    );
+
+    std::fs::write(&path, "entries:\n  - id: a\n    name: x\n").unwrap();
+    let reported = wait_for(&fired, Duration::from_secs(5));
+    stop.store(true, Ordering::Relaxed);
+    busy.join().unwrap();
+    assert!(reported, "the config change was never reported");
+}
