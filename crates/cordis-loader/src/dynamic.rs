@@ -336,6 +336,19 @@ impl DynamicPluginResolver {
             .find(|path| path.is_file())
     }
 
+    /// Library files loaded so far, one per plugin name.
+    ///
+    /// A loaded library is never unloaded (see the [module docs](self)), so
+    /// replacing one of these files in place cannot take effect in this
+    /// process; a library under a *new* name can, by pointing an entry at
+    /// that name. `cordis run --plugin-swap` uses this to tell the two apart.
+    pub fn loaded_paths(&self) -> Vec<PathBuf> {
+        crate::lock(&self.loaded)
+            .values()
+            .map(|plugin| plugin.path.clone())
+            .collect()
+    }
+
     fn loaded_plugin(&self, name: &str) -> Result<LoadedPlugin> {
         // The lock is held across loading: dlopen and the symbol checks are
         // fast, and holding it makes check-then-load atomic.
