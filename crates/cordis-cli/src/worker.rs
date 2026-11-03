@@ -2,12 +2,12 @@
 
 use cordis::Context;
 use cordis_loader::{Loader, LoaderConfig, PluginRegistry};
-use notify::{Config as NotifyConfig, RecursiveMode, Watcher};
+use notify::{Config as NotifyConfig, EventKind, RecursiveMode, Watcher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Exit code asking the daemon for a hot restart.
 pub const EXIT_RESTART: i32 = 51;
@@ -134,12 +134,17 @@ pub fn run(config_path: &Path, plugin_dirs: &[PathBuf]) -> ! {
         }
     }
 
-    match loader.watch() {
-        Ok(_watcher) => {}
-        Err(error) => eprintln!(
-            "cordis: config hot reload disabled ({error}); restart manually to apply changes"
-        ),
-    }
+    // Dropping the watcher stops it, so it must live as long as the worker
+    // (this function never returns).
+    let _config_watcher = match loader.watch() {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            eprintln!(
+                "cordis: config hot reload disabled ({error}); restart manually to apply changes"
+            );
+            None
+        }
+    };
 
     if !plugin_dirs.is_empty() {
         // A changed library only takes effect through a fresh worker: the
@@ -198,22 +203,31 @@ fn watch_plugin_dirs(dirs: &[PathBuf], handle: Arc<WorkerHandle>) -> Result<(), 
         .name("cordis-plugin-watch".to_owned())
         .spawn(move || {
             let _watcher = watcher; // keep the watch alive for the thread's lifetime
-            let mut pending = false;
+            // Settle on library changes only: unrelated activity in the
+            // directory must not postpone the restart.
+            let mut last_change: Option<Instant> = None;
             loop {
-                match rx.recv_timeout(PLUGIN_CHANGE_DEBOUNCE) {
+                let wait = last_change.map_or(PLUGIN_CHANGE_DEBOUNCE, |at| {
+                    PLUGIN_CHANGE_DEBOUNCE
+                        .saturating_sub(at.elapsed())
+                        .max(Duration::from_millis(1))
+                });
+                match rx.recv_timeout(wait) {
+                    // Opening or reading a library (the loader's own
+                    // dlopen included) changes nothing; only writes,
+                    // creations, renames and removals count.
+                    Ok(Ok(event)) if matches!(event.kind, EventKind::Access(_)) => {}
                     Ok(Ok(event)) => {
                         if event.paths.iter().any(|path| is_plugin_library(path)) {
-                            pending = true;
+                            last_change = Some(Instant::now());
                         }
                     }
-                    Ok(Err(_)) => {}
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if pending {
-                            eprintln!("cordis: plugin library changed, restarting worker");
-                            handle.restart();
-                        }
-                    }
+                    Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if last_change.is_some_and(|at| at.elapsed() >= PLUGIN_CHANGE_DEBOUNCE) {
+                    eprintln!("cordis: plugin library changed, restarting worker");
+                    handle.restart();
                 }
             }
         })
