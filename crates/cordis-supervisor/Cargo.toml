@@ -1,0 +1,32 @@
+[package]
+name = "cordis-supervisor"
+version = "0.0.1"
+description = "Erlang/OTP-style supervision of plugin tasks for the cordis-rs plugin framework, built on ash-flare"
+keywords = ["cordis", "plugin", "supervisor", "fault-tolerance"]
+categories = ["asynchronous", "rust-patterns"]
+edition.workspace = true
+# Documented exception to the workspace MSRV (1.85): ash-flare requires 1.88.
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+# Depends on ash-flare through git until the supervision fixes are released
+# on crates.io; crates with git dependencies cannot be published.
+publish = false
+
+[features]
+default = []
+# `SupervisionConfig::from_node`: read supervision settings from a
+# cordis-include config node (the loader's per-entry config).
+node = ["dep:cordis-include"]
+
+[dependencies]
+ash-flare.workspace = true
+async-trait.workspace = true
+cordis-include = { workspace = true, optional = true }
+cordis-rs.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+cordis-include.workspace = true
+cordis-loader = { workspace = true, features = ["dynamic", "watch"] }

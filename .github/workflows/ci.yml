@@ -31,11 +31,30 @@ jobs:
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@1.85.0
 
+      # cordis-supervisor is the documented MSRV exception (ash-flare needs
+      # 1.88); it has its own job below.
       - name: Check all targets and features
-        run: cargo check --locked --workspace --all-targets --all-features
+        run: cargo check --locked --workspace --exclude cordis-supervisor --all-targets --all-features
 
       - name: Run tests
-        run: cargo test --locked --workspace --all-features
+        run: cargo test --locked --workspace --exclude cordis-supervisor --all-features
+
+  msrv-supervisor:
+    name: MSRV cordis-supervisor (Rust 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Check all targets and features
+        run: cargo check --locked -p cordis-supervisor --all-targets --all-features
+
+      - name: Run tests
+        run: cargo test --locked -p cordis-supervisor --all-features
 
   audit:
     name: Dependency audit

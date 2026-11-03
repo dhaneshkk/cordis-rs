@@ -35,6 +35,7 @@ The crate currently ports the complete **core runtime**:
 | Intercept meta-events (`internal/get`/`set`/`config`/`update`/`listener`) | not ported | Not included |
 | Decorators and callable services | explicit Rust traits/builders | Rust-native |
 | Loader / include packages | [`cordis-include`](../crates/cordis-include), [`cordis-group`](../crates/cordis-group), [`cordis-loader`](../crates/cordis-loader), [`cordis-cli`](../crates/cordis-cli) | ✅ separate crates |
+| Task supervision (not in upstream Cordis) | [`cordis-supervisor`](../crates/cordis-supervisor): Erlang/OTP-style restarts for plugin tasks, built on ash-flare | ✅ separate crate (Rust 1.88) |
 
 1. Rust cannot dynamically project arbitrary struct fields like a JavaScript Proxy, so `alias()` is the explicit counterpart to common `mixin()` usage.
 2. Rust plugin code registers multiple effects explicitly; `EffectHandle::adopt()` provides the original nested diagnostic/disposal tree.
@@ -72,6 +73,7 @@ The minimum supported Rust version (MSRV) is **Rust 1.85**, and the crate uses *
 - **Review factors:** maintainers consider the compiler shipped by stable Linux distributions, requirements of official plugins and downstream projects, useful language or standard-library improvements, dependency/security constraints, and toolchain versions actually used by downstream users.
 - **Version changes:** the MSRV is raised only when there is a concrete maintenance or ecosystem benefit. An increase is documented in the changelog and release notes and is made in a minor release, never silently in a patch release.
 - **Workspace consistency:** official Cordis crates and plugins should use one shared MSRV unless a documented platform constraint requires an exception.
+- **Current exception:** `cordis-supervisor` requires Rust 1.88, the MSRV of its `ash-flare` dependency. It is excluded from the 1.85 CI job and checked by its own 1.88 job; no other crate depends on it.
 
 ## Quick start
 

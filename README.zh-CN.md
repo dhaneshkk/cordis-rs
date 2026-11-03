@@ -35,6 +35,7 @@ Cordis 是一个基于上下文的插件框架，适用于需要显式依赖注�
 | 拦截元事件（`internal/get`/`set`/`config`/`update`/`listener`） | 未移植 | 未包含 |
 | 装饰器和可调用服务 | 显式 Rust trait/builder | Rust 原生实现 |
 | Loader / include 包 | [`cordis-include`](../crates/cordis-include)、[`cordis-group`](../crates/cordis-group)、[`cordis-loader`](../crates/cordis-loader)、[`cordis-cli`](../crates/cordis-cli) | ✅ 独立 crate |
+| 任务监督（上游 Cordis 中没有） | [`cordis-supervisor`](../crates/cordis-supervisor)：基于 ash-flare 的 Erlang/OTP 风格插件任务重启 | ✅ 独立 crate（Rust 1.88） |
 
 1. Rust 无法像 JavaScript Proxy 一样动态投影任意 struct 字段，因此 `alias()` 是常见 `mixin()` 用法的显式对应方案。
 2. Rust 插件代码会显式注册多个 effect；`EffectHandle::adopt()` 提供与原版对应的嵌套诊断和回收树。
@@ -72,6 +73,7 @@ cordis-rs = "0.4"
 - **评估因素：** 维护者会考虑稳定版 Linux 发行版自带的编译器、官方插件和下游项目的要求、有价值的语言或标准库改进、依赖及安全限制，以及下游用户实际使用的工具链版本。
 - **版本变更：** 只有存在明确的维护或生态收益时才提高 MSRV。提高版本必须记录在 changelog 和 release notes 中，并通过 minor 版本发布，绝不在 patch 版本中静默变更。
 - **Workspace 一致性：** 除非存在有文档说明的平台限制，否则官方 Cordis crate 和插件应使用统一的 MSRV。
+- **当前例外：** `cordis-supervisor` 需要 Rust 1.88（其依赖 `ash-flare` 的 MSRV）。它不参与 1.85 的 CI 任务，由单独的 1.88 任务检查；其他 crate 均不依赖它。
 
 ## 快速开始
 
