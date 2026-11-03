@@ -258,3 +258,171 @@ fn replacing_a_plugin_library_hot_restarts_the_worker() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Write `contents` to `path` atomically, so the config watcher never sees
+/// a half-written file.
+fn write_atomically(path: &Path, contents: &str) {
+    let staged = path.with_extension("json.staged");
+    std::fs::write(&staged, contents).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+fn writer_entries(name: &str, out: &Path) -> String {
+    format!(
+        r#"{{"entries":[{{"id":"w","name":"{name}","config":{{"out":"{}"}}}}]}}"#,
+        json_path(out)
+    )
+}
+
+/// A `cordis run --plugin-swap` process group whose stderr goes to a log
+/// file. Dropping it (for example when an assertion fails) kills the
+/// whole group, so failed runs do not leave workers behind.
+struct SwapRun {
+    child: Option<std::process::Child>,
+    log: PathBuf,
+}
+
+impl SwapRun {
+    fn start(dir: &Path, config: &Path, plugins: &Path) -> Self {
+        // Not next to the config: the config watcher observes that directory.
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log = logs.join("cordis.log");
+        let child = Command::new(env!("CARGO_BIN_EXE_cordis"))
+            .arg("run")
+            .arg(config)
+            .arg("--plugin-dir")
+            .arg(plugins)
+            .arg("--plugin-swap")
+            .process_group(0)
+            .stderr(std::fs::File::create(&log).unwrap())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn cordis binary");
+        Self {
+            child: Some(child),
+            log,
+        }
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn wait_for(&self, what: &str, check: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if check() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for {what}; cordis stderr:\n{}",
+            self.log()
+        );
+    }
+
+    /// SIGTERM the group like Ctrl+C, wait, and return the exit code and log.
+    fn stop(mut self) -> (Option<i32>, String) {
+        let mut child = self.child.take().unwrap();
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", &format!("-{}", child.id())])
+            .status();
+        let status = child.wait().expect("wait for cordis");
+        (status.code(), self.log())
+    }
+}
+
+impl Drop for SwapRun {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .status();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn plugin_swap_adopts_a_new_library_without_restarting_the_worker() {
+    let dir = temp_dir("swap");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let build = dir.join("build");
+    let v1 = compile_plugin(&build, "file_writer", &[]);
+    let v2 = compile_plugin(&build, "file_writer_v2", &["hmr_v2"]);
+    std::fs::copy(&v1, plugins.join(cdylib_file_name("file_writer"))).unwrap();
+
+    let out = dir.join("out.txt");
+    let config = dir.join("cordis.json");
+    std::fs::write(&config, writer_entries("file_writer", &out)).unwrap();
+    let run = SwapRun::start(&dir, &config, &plugins);
+    run.wait_for("the first build to write v1", || {
+        std::fs::read_to_string(&out).ok().as_deref() == Some("v1")
+    });
+
+    // A new library under a new name does not restart the worker...
+    let staged = dir.join("staged.so");
+    std::fs::copy(&v2, &staged).unwrap();
+    std::fs::rename(&staged, plugins.join(cdylib_file_name("file_writer_v2"))).unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // ...until the config points the entry at it, which swaps that plugin
+    // in place through config hot reload.
+    write_atomically(&config, &writer_entries("file_writer_v2", &out));
+    run.wait_for("the swapped-in build to write v2", || {
+        std::fs::read_to_string(&out).ok().as_deref() == Some("v2")
+    });
+
+    let (code, stderr) = run.stop();
+    assert!(
+        !stderr.contains("restarting worker") && !stderr.contains("respawning"),
+        "the swap must not restart the worker; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("swapped in through the config"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, Some(0), "daemon should exit 0; stderr: {stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plugin_swap_still_restarts_when_a_loaded_library_is_replaced() {
+    let dir = temp_dir("swap-in-place");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let build = dir.join("build");
+    let v1 = compile_plugin(&build, "file_writer", &[]);
+    let v2 = compile_plugin(&build, "file_writer_v2", &["hmr_v2"]);
+    std::fs::copy(&v1, plugins.join(cdylib_file_name("file_writer"))).unwrap();
+
+    let out = dir.join("out.txt");
+    let config = dir.join("cordis.json");
+    std::fs::write(&config, writer_entries("file_writer", &out)).unwrap();
+    let run = SwapRun::start(&dir, &config, &plugins);
+    run.wait_for("the first build to write v1", || {
+        std::fs::read_to_string(&out).ok().as_deref() == Some("v1")
+    });
+
+    // The loaded library cannot be replaced in this process, so the worker
+    // restarts to pick the new file up, as without --plugin-swap.
+    let staged = dir.join("staged.so");
+    std::fs::copy(&v2, &staged).unwrap();
+    std::fs::rename(&staged, plugins.join(cdylib_file_name("file_writer"))).unwrap();
+    run.wait_for("the restarted worker to write v2", || {
+        std::fs::read_to_string(&out).ok().as_deref() == Some("v2")
+    });
+
+    let (code, stderr) = run.stop();
+    assert!(
+        stderr.contains("plugin library changed, restarting worker"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, Some(0), "daemon should exit 0; stderr: {stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

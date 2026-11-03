@@ -1,6 +1,7 @@
 //! Worker runtime: boot the loader, watch the config, exit on signals.
 
 use cordis::Context;
+use cordis_loader::dynamic::DynamicPluginResolver;
 use cordis_loader::{Loader, LoaderConfig, PluginRegistry};
 use notify::{Config as NotifyConfig, EventKind, RecursiveMode, Watcher};
 use std::io::Read;
@@ -65,11 +66,17 @@ impl WorkerInner {
 /// plugin directories, if any), watch the entry file and the plugin
 /// directories, and block until a signal (or a `worker` service call)
 /// exits the process. Never returns.
-pub fn run(config_path: &Path, plugin_dirs: &[PathBuf]) -> ! {
+///
+/// With `plugin_swap`, a library change only restarts the worker when that
+/// library is already loaded; see [`crate::Options::plugin_swap`].
+pub fn run(config_path: &Path, plugin_dirs: &[PathBuf], plugin_swap: bool) -> ! {
     let root = Context::new();
     let mut registry = PluginRegistry::new();
+    let resolver = DynamicPluginResolver::new(plugin_dirs.iter());
     if !plugin_dirs.is_empty() {
-        registry = registry.with_dynamic_dirs(plugin_dirs.iter());
+        // Clones share the loaded-library cache, so the watcher below sees
+        // what the loader has opened.
+        registry.set_dynamic(resolver.clone());
     }
     let loader = match Loader::open(
         &root,
@@ -149,10 +156,18 @@ pub fn run(config_path: &Path, plugin_dirs: &[PathBuf]) -> ! {
     if !plugin_dirs.is_empty() {
         // A changed library only takes effect through a fresh worker: the
         // old process never unloads a mapped library, so the watcher asks
-        // the daemon for a restart instead of reloading in place.
-        match watch_plugin_dirs(plugin_dirs, handle) {
+        // the daemon for a restart instead of reloading in place. In swap
+        // mode only loaded libraries count; new files wait for the config.
+        let swap = plugin_swap.then_some(resolver);
+        let mode = if swap.is_some() {
+            "changes to loaded libraries hot-restart the worker; \
+             new libraries are swapped in through the config"
+        } else {
+            "library changes hot-restart the worker"
+        };
+        match watch_plugin_dirs(plugin_dirs, handle, swap) {
             Ok(()) => eprintln!(
-                "cordis: dynamic plugins from {} (library changes hot-restart the worker)",
+                "cordis: dynamic plugins from {} ({mode})",
                 plugin_dirs
                     .iter()
                     .map(|dir| dir.display().to_string())
@@ -187,9 +202,14 @@ pub fn run(config_path: &Path, plugin_dirs: &[PathBuf]) -> ! {
 ///
 /// Only files with a dynamic-library extension count; matching by
 /// extension (instead of exact paths) also absorbs macOS FSEvents
-/// reporting realpaths. The thread ends the process on the first settled
-/// change, so there is nothing to return.
-fn watch_plugin_dirs(dirs: &[PathBuf], handle: Arc<WorkerHandle>) -> Result<(), String> {
+/// reporting realpaths. With `swap`, a change only counts when its file
+/// name matches a library `swap` has already loaded. The thread ends the
+/// process on the first settled change, so there is nothing to return.
+fn watch_plugin_dirs(
+    dirs: &[PathBuf],
+    handle: Arc<WorkerHandle>,
+    swap: Option<DynamicPluginResolver>,
+) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::RecommendedWatcher::new(tx, NotifyConfig::default())
         .map_err(|error| format!("cannot create watcher: {error}"))?;
@@ -203,8 +223,8 @@ fn watch_plugin_dirs(dirs: &[PathBuf], handle: Arc<WorkerHandle>) -> Result<(), 
         .name("cordis-plugin-watch".to_owned())
         .spawn(move || {
             let _watcher = watcher; // keep the watch alive for the thread's lifetime
-            // Settle on library changes only: unrelated activity in the
-            // directory must not postpone the restart.
+            // Settle on changes to relevant libraries only: unrelated
+            // activity in the directory must not postpone the restart.
             let mut last_change: Option<Instant> = None;
             loop {
                 let wait = last_change.map_or(PLUGIN_CHANGE_DEBOUNCE, |at| {
@@ -218,7 +238,13 @@ fn watch_plugin_dirs(dirs: &[PathBuf], handle: Arc<WorkerHandle>) -> Result<(), 
                     // creations, renames and removals count.
                     Ok(Ok(event)) if matches!(event.kind, EventKind::Access(_)) => {}
                     Ok(Ok(event)) => {
-                        if event.paths.iter().any(|path| is_plugin_library(path)) {
+                        let relevant = event.paths.iter().any(|path| {
+                            is_plugin_library(path)
+                                && swap.as_ref().is_none_or(|resolver| {
+                                    is_loaded_library(path, &resolver.loaded_paths())
+                                })
+                        });
+                        if relevant {
                             last_change = Some(Instant::now());
                         }
                     }
@@ -233,6 +259,14 @@ fn watch_plugin_dirs(dirs: &[PathBuf], handle: Arc<WorkerHandle>) -> Result<(), 
         })
         .map_err(|error| format!("cannot spawn watcher thread: {error}"))?;
     Ok(())
+}
+
+/// Whether `path` names one of the `loaded` libraries. Compared by file
+/// name: the watched directories are the ones libraries are loaded from,
+/// and a replaced or removed file can no longer be canonicalized.
+fn is_loaded_library(path: &Path, loaded: &[PathBuf]) -> bool {
+    path.file_name()
+        .is_some_and(|name| loaded.iter().any(|loaded| loaded.file_name() == Some(name)))
 }
 
 /// Whether `path` looks like a dynamic library by extension.
@@ -258,5 +292,22 @@ mod tests {
         assert!(!is_plugin_library(Path::new("cordis.yml")));
         assert!(!is_plugin_library(Path::new("libgreeter.so.tmp")));
         assert!(!is_plugin_library(Path::new("plugins")));
+    }
+
+    #[test]
+    fn loaded_libraries_match_by_file_name() {
+        let loaded = [PathBuf::from("/srv/plugins/libzone_v1.so")];
+        assert!(is_loaded_library(
+            Path::new("/private/srv/plugins/libzone_v1.so"),
+            &loaded
+        ));
+        assert!(!is_loaded_library(
+            Path::new("/srv/plugins/libzone_v2.so"),
+            &loaded
+        ));
+        assert!(!is_loaded_library(
+            Path::new("/srv/plugins/libzone_v2.so"),
+            &[]
+        ));
     }
 }
