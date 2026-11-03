@@ -21,6 +21,12 @@
 //! to a library in those directories hot-restarts the worker so the new
 //! build is loaded by a fresh process.
 //!
+//! With `--plugin-swap`, only changes to a library the worker has already
+//! loaded restart it. A new library file (for example `libzone_v2.so`) is
+//! left for the config to adopt: pointing an entry's `name` at it swaps
+//! that one plugin in place through config hot reload, without restarting
+//! the worker or touching other plugins.
+//!
 //! Plugins reach the process controls through the `worker` service
 //! ([`worker::WorkerHandle`]): `restart()` maps to a full worker reload,
 //! and `shutdown()` stops the whole application.
@@ -106,10 +112,12 @@ fn next_backoff(previous: Option<Duration>, ran_for: Duration) -> Duration {
 
 /// Parsed command line.
 ///
-/// Mirrors `cordis run <config> [--plugin-dir <dir>]… [--worker|-w]`:
-/// [`config`](Options::config) is the positional entry file,
-/// [`plugin_dirs`](Options::plugin_dirs) collects every `--plugin-dir`
-/// (repeatable), and [`worker`](Options::worker) is set by `--worker`/`-w`.
+/// Mirrors `cordis run <config> [--plugin-dir <dir>]… [--plugin-swap]
+/// [--worker|-w]`: [`config`](Options::config) is the positional entry
+/// file, [`plugin_dirs`](Options::plugin_dirs) collects every
+/// `--plugin-dir` (repeatable), [`plugin_swap`](Options::plugin_swap) is
+/// set by `--plugin-swap`, and [`worker`](Options::worker) by
+/// `--worker`/`-w`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
     /// Entry config file (the positional `cordis run` argument).
@@ -117,6 +125,10 @@ pub struct Options {
     /// Directories searched for dynamic-library plugins (repeatable
     /// `--plugin-dir <dir>`).
     pub plugin_dirs: Vec<PathBuf>,
+    /// Restart the worker only when an already-loaded plugin library
+    /// changes; new library files are left for the config to adopt
+    /// (`--plugin-swap`).
+    pub plugin_swap: bool,
     /// Run as the daemon's worker process instead of supervising
     /// (`--worker`/`-w`).
     pub worker: bool,
@@ -125,7 +137,7 @@ pub struct Options {
 /// Parse `cordis` arguments (after the binary name).
 ///
 /// Accepted shape: `cordis run <config> [--plugin-dir <dir>]…
-/// [--worker|-w]` — the result is [`Options`].
+/// [--plugin-swap] [--worker|-w]` — the result is [`Options`].
 ///
 /// Arguments stay [`OsString`] end to end so config paths with non-UTF-8
 /// bytes (legal on Unix filesystems) reach the loader intact instead of
@@ -145,11 +157,13 @@ pub fn parse_args(args: &[OsString]) -> Result<Options, String> {
     let mut config = None;
     let mut plugin_dirs = Vec::new();
     let mut worker = false;
+    let mut plugin_swap = false;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         let bytes = arg.as_encoded_bytes();
         match bytes {
             b"--worker" | b"-w" => worker = true,
+            b"--plugin-swap" => plugin_swap = true,
             b"--help" | b"-h" => return Err(usage()),
             b"--plugin-dir" => {
                 let Some(value) = rest.next() else {
@@ -186,6 +200,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Options, String> {
         Some(config) => Ok(Options {
             config,
             plugin_dirs,
+            plugin_swap,
             worker,
         }),
         None => Err(format!("missing config file\n\n{}", usage())),
@@ -211,11 +226,14 @@ fn os_string_from_encoded_bytes(bytes: &[u8]) -> OsString {
 }
 
 fn usage() -> String {
-    "usage: cordis run <config.yml> [--plugin-dir <dir>]... [--worker]
+    "usage: cordis run <config.yml> [--plugin-dir <dir>]... [--plugin-swap] [--worker]
 
   run             start the loader from an entry config file
   --plugin-dir    also resolve plugins from dynamic libraries in <dir>
                   (repeatable); library changes there hot-restart the worker
+  --plugin-swap   only restart the worker when an already-loaded library
+                  changes; a new library file is adopted by pointing an
+                  entry's name at it (in-place swap, no worker restart)
   --worker        internal: run as the daemon's worker process
 
 Worker exit codes: 51 = hot restart, 52 = quit, 53 = boot failure.
@@ -246,13 +264,13 @@ where
         dotenv::load(&dir);
     }
     if options.worker {
-        worker::run(&options.config, &options.plugin_dirs);
+        worker::run(&options.config, &options.plugin_dirs, options.plugin_swap);
     }
-    supervise(&options.config, &options.plugin_dirs)
+    supervise(&options.config, &options.plugin_dirs, options.plugin_swap)
 }
 
 /// Supervise worker subprocesses until they quit or a signal arrives.
-fn supervise(config: &std::path::Path, plugin_dirs: &[PathBuf]) -> i32 {
+fn supervise(config: &std::path::Path, plugin_dirs: &[PathBuf], plugin_swap: bool) -> i32 {
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&shutdown);
     if ctrlc::set_handler(move || {
@@ -285,6 +303,9 @@ fn supervise(config: &std::path::Path, plugin_dirs: &[PathBuf]) -> i32 {
         command.arg("run").arg(config).arg("--worker");
         for dir in plugin_dirs {
             command.arg("--plugin-dir").arg(dir);
+        }
+        if plugin_swap {
+            command.arg("--plugin-swap");
         }
         // The worker watches this pipe: the daemon closes it when shutting
         // down, and the OS closes it when the daemon dies for any reason —
@@ -376,6 +397,7 @@ mod tests {
             Options {
                 config: "cordis.yml".into(),
                 plugin_dirs: Vec::new(),
+                plugin_swap: false,
                 worker: false,
             }
         );
@@ -384,8 +406,28 @@ mod tests {
             Options {
                 config: "cordis.yml".into(),
                 plugin_dirs: Vec::new(),
+                plugin_swap: false,
                 worker: true,
             }
+        );
+    }
+
+    #[test]
+    fn parses_plugin_swap() {
+        let options = parse_args(&args(&[
+            "run",
+            "cordis.yml",
+            "--plugin-dir",
+            "p",
+            "--plugin-swap",
+        ]))
+        .unwrap();
+        assert!(options.plugin_swap);
+        assert_eq!(options.plugin_dirs, vec![PathBuf::from("p")]);
+        assert!(
+            !parse_args(&args(&["run", "cordis.yml"]))
+                .unwrap()
+                .plugin_swap
         );
     }
 

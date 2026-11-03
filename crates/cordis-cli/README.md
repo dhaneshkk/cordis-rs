@@ -44,7 +44,16 @@ The stock binary registers only the built-in `group` plugin; entries with
 other names are recorded in the loader's `last_error()` and skipped,
 unless `--plugin-dir <dir>` (repeatable) lets them resolve from
 dynamic-library plugins fingerprint-checked against the running toolchain —
-a changed library hot-restarts the worker. Embedding applications register
+a changed library hot-restarts the worker.
+
+With `--plugin-swap`, only a change to a library the worker has already
+loaded restarts it. A new library file — say `libzone_v2.so` next to
+`libzone_v1.so` — is left alone until an entry's `name` points at it; config
+hot reload then swaps that one plugin in place (old fiber stopped, new
+library loaded) without restarting the worker or touching other plugins. The
+old library stays mapped until the process exits, since Rust code cannot be
+unloaded safely. See [cordis-supervisor](../cordis-supervisor) for keeping a
+swapped plugin's background tasks supervised. Embedding applications register
 their own plugins via
 [`cordis_loader::PluginRegistry`](https://docs.rs/cordis-loader) or fork
 this runner.

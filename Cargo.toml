@@ -10,6 +10,10 @@ license = "MIT"
 repository = "https://github.com/dshbox/cordis-rs"
 
 [workspace.dependencies]
+# Pinned to the dhaneshkk/ash-flare fork commit carrying the supervision
+# fixes (panic restarts, waiting shutdown, stale-exit filtering).
+ash-flare = { git = "https://github.com/dhaneshkk/ash-flare", rev = "cf274fec050fe9b4519eeacd8c560487dbd1e908", default-features = false }
+async-trait = "0.1"
 cordis-cli = { version = "0.0.21", path = "crates/cordis-cli" }
 cordis-group = { version = "0.0.16", path = "crates/cordis-group" }
 cordis-include = { version = "0.0.22", path = "crates/cordis-include" }
@@ -21,4 +25,5 @@ ryu = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "macros"] }
 unsafe-libyaml = "0.2"

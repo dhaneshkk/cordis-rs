@@ -10,7 +10,11 @@ use crate::file::LoaderFile;
 use notify::{Config as NotifyConfig, RecursiveMode, Watcher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Quiet period after the last change to the watched file before the
+/// callback fires.
+const DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// A running watch on one config file. Dropping it stops the watcher.
 ///
@@ -59,36 +63,45 @@ impl LoaderFile {
             .name(format!("cordis-watch-{}", self.path().display()))
             .spawn(move || {
                 let _watcher = watcher; // keep the watch alive for the thread's lifetime
-                let mut pending = false;
+                // Debounce on changes to *this* file only. Events for other
+                // files in the directory (a log being written, a sibling
+                // being read) must not keep pushing the reload back: with a
+                // busy neighbour the quiet window would otherwise never come.
+                let mut last_change: Option<Instant> = None;
                 loop {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    match rx.recv_timeout(Duration::from_millis(100)) {
+                    let wait = last_change.map_or(DEBOUNCE, |at| {
+                        DEBOUNCE
+                            .saturating_sub(at.elapsed())
+                            .max(Duration::from_millis(1))
+                    });
+                    match rx.recv_timeout(wait) {
                         Ok(Ok(event)) => {
                             // macOS FSEvents reports realpaths, so accept the
                             // canonicalized form of the file as well (e.g.
                             // /tmp/x.yml vs /private/tmp/x.yml). Only the file
                             // itself matches: sibling files in the watched
-                            // directory must not trigger a reload.
-                            let relevant = event
-                                .paths
-                                .iter()
-                                .any(|event_path| relevant_paths.contains(event_path));
+                            // directory must not trigger a reload. Reads of
+                            // the file change nothing.
+                            let relevant = !matches!(event.kind, notify::EventKind::Access(_))
+                                && event
+                                    .paths
+                                    .iter()
+                                    .any(|event_path| relevant_paths.contains(event_path));
                             if relevant {
-                                pending = true;
+                                last_change = Some(Instant::now());
                             }
                         }
-                        Ok(Err(_)) => {}
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if pending {
-                                pending = false;
-                                if !file.is_suspended() {
-                                    on_change();
-                                }
-                            }
-                        }
+                        Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    if last_change.is_some_and(|at| at.elapsed() >= DEBOUNCE) {
+                        last_change = None;
+                        if !file.is_suspended() {
+                            on_change();
+                        }
                     }
                 }
             })?;
